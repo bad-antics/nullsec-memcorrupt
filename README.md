@@ -95,4 +95,4 @@ NullSec Proprietary License
 ---
 
 [![GitHub](https://img.shields.io/badge/GitHub-bad--antics-181717?style=flat&logo=github&logoColor=white)](https://github.com/bad-antics)
-[![Discord](https://img.shields.io/badge/Twitter-AnonAntics-1DA1F2?style=flat&logo=discord&logoColor=white)](https://x.com/AnonAntics)
+[![X/Twitter](https://img.shields.io/badge/Twitter-AnonAntics-1DA1F2?style=flat&logo=x&logoColor=white)](https://x.com/AnonAntics)
